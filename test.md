@@ -1,0 +1,749 @@
+# 4.12 statefulset controller分析
+
+## StatefulSet
+
+StatefulSet 是用来管理有状态应用的高级工作负载，而 deployment 用于管理无状态应用。
+
+有状态的pod与无状态的pod不一样的是，有状态的pod有时候需要通过其主机名来定位，而无状态的不需要，因为无状态的pod每个都是一样的，随机选一个就行，但对于有状态的来说，每一个pod都不一样，通常希望操作的是特定的某一个。
+
+StatefulSet 适用于需要以下特点的应用：&#x20;
+
+（1）稳定的网络标志（主机名）：Pod重新调度后其PodName和HostName不变；&#x20;
+
+（2）稳定的持久化存储：基于PVC，Pod重新调度后仍能访问到相同的持久化数据；&#x20;
+
+（3）稳定的创建与扩容次序：有序创建或扩容，从序号小到大的顺序对pod进行创建（即从0到N-1），且在下一个Pod创建运行之前，所有之前的Pod必须都是Running和Ready状态；&#x20;
+
+<figure><img src="../../.gitbook/assets/截屏2024-07-27 10.19.39.png" alt=""><figcaption></figcaption></figure>
+
+（4）稳定的删除与缩容次序：有序删除或缩容，从序号大到小的顺序对pod进行删除（即从N-1到0），且在下一个Pod终止与删除之前，所有之前的Pod必须都已经被删除；&#x20;
+
+（5）稳定的滚动更新次序：从序号大到小的顺序对pod进行更新（即从N-1到0），先删除后创建，且需等待当前序号的pod再次创建完成且状态为Ready时才能进行下一个pod的更新处理。&#x20;
+
+## 示例
+
+下面例子中：
+
+* 名为 `nginx` 的 Headless Service 用来控制网络域名。
+* 名为 `web` 的 StatefulSet 有一个 Spec，它表明将在独立的 3 个 Pod 副本中启动 nginx 容器。
+* `volumeClaimTemplates` 将通过 PersistentVolume 制备程序所准备的 [PersistentVolumes](https://kubernetes.io/zh-cn/docs/concepts/storage/persistent-volumes/) 来提供稳定的存储。
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  ports:
+  - port: 80
+    name: web
+  clusterIP: None
+  selector:
+    app: nginx
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels:
+      app: nginx # 必须匹配 .spec.template.metadata.labels
+  serviceName: "nginx"
+  replicas: 3 # 默认值是 1
+  minReadySeconds: 10 # 默认值是 0
+  template:
+    metadata:
+      labels:
+        app: nginx # 必须匹配 .spec.selector.matchLabels
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: nginx
+        image: registry.k8s.io/nginx-slim:0.24
+        ports:
+        - containerPort: 80
+          name: web
+        volumeMounts:
+        - name: www
+          mountPath: /usr/share/nginx/html
+  volumeClaimTemplates:
+  - metadata:
+      name: www
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "my-storage-class"
+      resources:
+        requests:
+          storage: 1Gi
+```
+
+## **StatefulSet controller**
+
+StatefulSet controller 是 kube-controller-manager 众多控制器中的一个，是 StatefulSet 资源对象的控制器，对 StatefulSet、pod 资源进行监听，当资源发生变化时会触发 StatefulSet controller 对相应的StatefulSet资源对象进行调谐操作，从而完成 StatefulSet对于pod的创建、删除、更新、扩缩容、StatefulSet的滚动更新、StatefulSet状态更新、旧版本 StatefulSet 清理等操作。
+
+
+
+### **架构图**
+
+StatefulSet controller 的大致组成和处理流程如下图，当事件发生时，控制器会watch到然后将对应的StatefulSet 对象放入到 queue 中，然后调用`syncStatefulSet`方法协调。
+
+<figure><img src="../../.gitbook/assets/image.png" alt=""><figcaption></figcaption></figure>
+
+### **pod 的命名规则、pod 创建与删除**
+
+如果创建一个名称为web、replicas为3的statefulset对象，则其pod名称分别为web-0、web-1、web-2。
+
+StatefulSet pod的创建按0 - n的顺序创建，且在创建下一个pod之前，需要等待前一个pod创建完成并处于ready状态。
+
+同样拿上面的例子来说明，在web statefulset创建后，3 个 Pod 将按顺序创建 web-0，web-1，web-2。在 web-0 处于 ready 状态之前，web-1 将不会被创建，同样当 web-1 处于ready状态之前 web-2也不会被创建。如果在 web-1 ready后，web-2 创建之前， web-0 不处于ready状态了，这个时候 web-2 将不会被创建，直到 web-0 再次回到ready状态。
+
+StatefulSet滚动更新或缩容过程中pod的删除按n - 0的顺序删除，且在删除下一个pod之前，需要等待前一个pod删除完成。
+
+另外，当 StatefulSet.Spec.VolumeClaimTemplates中定义了pod所需的pvc时，StatefulSet controller在创建pod时，会同时创建对应的pvc出来，但删除pod时，不会做对应pvc的删除操作，这些pvc需要人工额外做删除操作。
+
+### **更新策略**
+
+StatefulSet 的 `.spec.updateStrategy` 字段让你可以配置和禁用掉自动滚动更新 Pod 的容器、标签、资源请求或限制、以及注解。有两个允许的值：
+
+**`(1)OnDelete`**
+
+当 StatefulSet 的 `.spec.updateStrategy.type` 设置为 `OnDelete` 时， 它的控制器将不会自动更新 StatefulSet 中的 Pod。 用户必须手动删除 Pod 以便让控制器创建新的 Pod，以此来对 StatefulSet 的 `.spec.template` 的变动作出反应。
+
+**`(2)RollingUpdateRollingUpdate`**&#x20;
+
+更新策略对 StatefulSet 中的 Pod 执行自动的滚动更新。这是默认的更新策略。
+
+**滚动升级**中还有一个 Partition 配置，在设置partition后，滚动更新过程中，StatefulSet的Pod中序号大于或等于partition的Pod会进行滚动升级，而其余的Pod保持不变，不会进行滚动更新。
+
+#### 最大不可用 Pod[ ](https://kubernetes.io/zh-cn/docs/concepts/workloads/controllers/statefulset/#maximum-unavailable-pods) <a href="#maximum-unavailable-pods" id="maximum-unavailable-pods"></a>
+
+你可以通过指定 `.spec.updateStrategy.rollingUpdate.maxUnavailable` 字段来控制更新期间不可用的 Pod 的最大数量。 该值可以是绝对值（例如，“5”）或者是期望 Pod 个数的百分比（例如，`10%`）。 绝对值是根据百分比值四舍五入计算的。 该字段不能为 0。默认设置为 1。
+
+该字段适用于 `0` 到 `replicas - 1` 范围内的所有 Pod。 如果在 `0` 到 `replicas - 1` 范围内存在不可用 Pod，这类 Pod 将被计入 `maxUnavailable` 值。
+
+### PersistentVolumeClaim 保留
+
+在 StatefulSet 的生命周期中，可选字段 `.spec.persistentVolumeClaimRetentionPolicy` 控制是否删除以及如何删除 PVC。 使用该字段，你必须在 API 服务器和控制器管理器启用 `StatefulSetAutoDeletePVC` [特性门控](https://kubernetes.io/zh-cn/docs/reference/command-line-tools-reference/feature-gates/)。 启用后，你可以为每个 StatefulSet 配置两个策略：
+
+**`(1)whenDeleted`**
+
+配置删除 StatefulSet 时应用的卷保留行为。
+
+**`(2)whenScaled`**
+
+配置当 StatefulSet 的副本数减少时应用的卷保留行为；例如，缩小集合时。
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+...
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
+...
+```
+
+对于你可以配置的每个策略，你可以将值设置为 `Delete` 或 `Retain`。
+
+**`Delete`**对于受策略影响的每个 Pod，基于 StatefulSet 的 `volumeClaimTemplate` 字段创建的 PVC 都会被删除。 使用 `whenDeleted` 策略，所有来自 `volumeClaimTemplate` 的 PVC 在其 Pod 被删除后都会被删除。 使用 `whenScaled` 策略，只有与被缩减的 Pod 副本对应的 PVC 在其 Pod 被删除后才会被删除。
+
+**`Retain`（默认）**来自 `volumeClaimTemplate` 的 PVC 在 Pod 被删除时不受影响。这是此新功能之前的行为。
+
+请记住，这些策略**仅**适用于由于 StatefulSet 被删除或被缩小而被删除的 Pod。 例如，如果与 StatefulSet 关联的 Pod 由于节点故障而失败， 并且控制平面创建了替换 Pod，则 StatefulSet 保留现有的 PVC。 现有卷不受影响，集群会将其附加到新 Pod 即将启动的节点上。
+
+## 源码分析
+
+基于 tag 1.30.0
+
+### **1.初始化与启动分析**
+
+1. 调用statefulset.NewStatefulSetController新建并初始化StatefulSetController
+2. 拉起一个goroutine，执行 StatefulSetController 的 Run方法
+
+```go
+func startStatefulSetController(ctx context.Context, controllerContext ControllerContext, controllerName string) (controller.Interface, bool, error) {
+	go statefulset.NewStatefulSetController(
+		ctx,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Apps().V1().StatefulSets(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		controllerContext.InformerFactory.Apps().V1().ControllerRevisions(),
+		controllerContext.ClientBuilder.ClientOrDie("statefulset-controller"),
+	).Run(ctx, int(controllerContext.ComponentConfig.StatefulSetController.ConcurrentStatefulSetSyncs))
+	return nil, true, nil
+}
+```
+
+### **1.1 statefulset.NewStatefulSetController**
+
+从`statefulset.NewStatefulSetController`函数代码中可以看到，statefulset controller注册了statefulset、pod对象的 EventHandler，也即对这几个对象的event进行监听，把event放入事件队列并做处理。
+
+```go
+// NewStatefulSetController creates a new statefulset controller.
+func NewStatefulSetController(
+	ctx context.Context,
+	podInformer coreinformers.PodInformer,
+	setInformer appsinformers.StatefulSetInformer,
+	pvcInformer coreinformers.PersistentVolumeClaimInformer,
+	revInformer appsinformers.ControllerRevisionInformer,
+	kubeClient clientset.Interface,
+) *StatefulSetController {
+	logger := klog.FromContext(ctx)
+	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "statefulset-controller"})
+	ssc := &StatefulSetController{
+		kubeClient: kubeClient,
+		control: NewDefaultStatefulSetControl(
+			NewStatefulPodControl(
+				kubeClient,
+				podInformer.Lister(),
+				pvcInformer.Lister(),
+				recorder),
+			NewRealStatefulSetStatusUpdater(kubeClient, setInformer.Lister()),
+			history.NewHistory(kubeClient, revInformer.Lister()),
+		),
+		pvcListerSynced: pvcInformer.Informer().HasSynced,
+		revListerSynced: revInformer.Informer().HasSynced,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "statefulset"},
+		),
+		podControl: controller.RealPodControl{KubeClient: kubeClient, Recorder: recorder},
+
+		eventBroadcaster: eventBroadcaster,
+	}
+
+	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		// lookup the statefulset and enqueue
+		AddFunc: func(obj interface{}) {
+			ssc.addPod(logger, obj)
+		},
+		// lookup current and old statefulset if labels changed
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			ssc.updatePod(logger, oldObj, newObj)
+		},
+		// lookup statefulset accounting for deletion tombstones
+		DeleteFunc: func(obj interface{}) {
+			ssc.deletePod(logger, obj)
+		},
+	})
+	ssc.podLister = podInformer.Lister()
+	ssc.podListerSynced = podInformer.Informer().HasSynced
+
+	setInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: ssc.enqueueStatefulSet,
+			UpdateFunc: func(old, cur interface{}) {
+				oldPS := old.(*apps.StatefulSet)
+				curPS := cur.(*apps.StatefulSet)
+				if oldPS.Status.Replicas != curPS.Status.Replicas {
+					logger.V(4).Info("Observed updated replica count for StatefulSet", "statefulSet", klog.KObj(curPS), "oldReplicas", oldPS.Status.Replicas, "newReplicas", curPS.Status.Replicas)
+				}
+				ssc.enqueueStatefulSet(cur)
+			},
+			DeleteFunc: ssc.enqueueStatefulSet,
+		},
+	)
+	ssc.setLister = setInformer.Lister()
+	ssc.setListerSynced = setInformer.Informer().HasSynced
+
+	// TODO: Watch volumes
+	return ssc
+}
+
+```
+
+### **1.2 Run**
+
+启动5个 goroutine，执行`ssc.worker`方法, 最终会调用到 sync 方法
+
+```go
+// Run runs the statefulset controller.
+func (ssc *StatefulSetController) Run(ctx context.Context, workers int) {
+	defer utilruntime.HandleCrash()
+
+	// Start events processing pipeline.
+	ssc.eventBroadcaster.StartStructuredLogging(3)
+	ssc.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: ssc.kubeClient.CoreV1().Events("")})
+	defer ssc.eventBroadcaster.Shutdown()
+
+	defer ssc.queue.ShutDown()
+
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting stateful set controller")
+	defer logger.Info("Shutting down statefulset controller")
+
+	if !cache.WaitForNamedCacheSync("stateful set", ctx.Done(), ssc.podListerSynced, ssc.setListerSynced, ssc.pvcListerSynced, ssc.revListerSynced) {
+		return
+	}
+
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, ssc.worker, time.Second)
+	}
+
+	<-ctx.Done()
+}
+
+```
+
+### **1.2.1 ssc.worker**
+
+从queue队列中取出事件key，并调用`ssc.sync`（关于ssc.sync方法会在后面做详细分析）对statefulset对象做调谐处理。queue队列里的事件来源前面讲过，是statefulset controller注册的statefulset、pod对象的EventHandler 事件，它们的变化event会被监听到然后放入queue中。
+
+```go
+// worker runs a worker goroutine that invokes processNextWorkItem until the controller's queue is closed
+func (ssc *StatefulSetController) worker(ctx context.Context) {
+	for ssc.processNextWorkItem(ctx) {
+	}
+}
+
+// processNextWorkItem dequeues items, processes them, and marks them done. It enforces that the syncHandler is never
+// invoked concurrently with the same key.
+func (ssc *StatefulSetController) processNextWorkItem(ctx context.Context) bool {
+	key, quit := ssc.queue.Get()
+	if quit {
+		return false
+	}
+	defer ssc.queue.Done(key)
+	if err := ssc.sync(ctx, key); err != nil {
+		utilruntime.HandleError(fmt.Errorf("error syncing StatefulSet %v, requeuing: %w", key, err))
+		ssc.queue.AddRateLimited(key)
+	} else {
+		ssc.queue.Forget(key)
+	}
+	return true
+}
+
+```
+
+### **2.核心处理逻辑分析**
+
+sync 函数主要逻辑：
+
+1. 获取当前时间，并定义`defer`函数，用于计算该方法总执行时间，也即统计对一个 statefulset 进行同步调谐操作的耗时；
+2. 根据 StatefulSet 对象的命名空间与名称，获取 StatefulSet 对象；
+3. 调用 ssc.adoptOrphanRevisions 方法，检查是否有孤儿 controllerrevisions 对象（即.spec.ownerReferences中无controller属性定义或其属性值为false），若有且其与 statefulset 对象的selector匹配 的则添加 ownerReferences 进行关联；
+4. 调用 ssc.getPodsForStatefulSet，根据 statefulset 对象的selector去查找pod列表，且若有孤儿pod的label与 statefulset 的selector能匹配的则进行关联，若已关联的pod的label不再与statefulset的selector匹配，则更新解除它们的关联关系；
+5. 调用ssc.syncStatefulSet，对 statefulset 对象做调谐处理。
+
+```go
+// sync syncs the given statefulset.
+func (ssc *StatefulSetController) sync(ctx context.Context, key string) error {
+	startTime := time.Now()
+	logger := klog.FromContext(ctx)
+	defer func() {
+		logger.V(4).Info("Finished syncing statefulset", "key", key, "time", time.Since(startTime))
+	}()
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return err
+	}
+	set, err := ssc.setLister.StatefulSets(namespace).Get(name)
+	if errors.IsNotFound(err) {
+		logger.Info("StatefulSet has been deleted", "key", key)
+		return nil
+	}
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("unable to retrieve StatefulSet %v from store: %v", key, err))
+		return err
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("error converting StatefulSet %v selector: %v", key, err))
+		// This is a non-transient error, so don't retry.
+		return nil
+	}
+
+	if err := ssc.adoptOrphanRevisions(ctx, set); err != nil {
+		return err
+	}
+
+	pods, err := ssc.getPodsForStatefulSet(ctx, set, selector)
+	if err != nil {
+		return err
+	}
+
+	return ssc.syncStatefulSet(ctx, set, pods)
+}
+```
+
+### **2.1 ssc.getPodsForStatefulSet**
+
+ssc.getPodsForStatefulSet方法主要作用是获取属于 statefulset 对象的pod列表并返回，并检查孤儿pod与已匹配的pod，看是否需要更新statefulset与pod的匹配。
+
+主要逻辑：&#x20;
+
+1. 获取 statefulset 所在命名空间下的所有pod；&#x20;
+2. 定义过滤出属于 statefulset 对象的pod的函数，即isMemberOf函数（根据pod的名称与statefulset名称匹配来过滤属于statefulset的pod）；&#x20;
+3. 调用cm.ClaimPods，过滤出属于该statefulset对象的pod，且若有孤儿pod的label与 statefulset 的selector能匹配的则进行关联，若已关联的pod的label不再与statefulset的selector匹配，则更新解除它们的关联关系。
+
+```go
+// getPodsForStatefulSet returns the Pods that a given StatefulSet should manage.
+// It also reconciles ControllerRef by adopting/orphaning.
+//
+// NOTE: Returned Pods are pointers to objects from the cache.
+// If you need to modify one, you need to copy it first.
+func (ssc *StatefulSetController) getPodsForStatefulSet(ctx context.Context, set *apps.StatefulSet, selector labels.Selector) ([]*v1.Pod, error) {
+	// List all pods to include the pods that don't match the selector anymore but
+	// has a ControllerRef pointing to this StatefulSet.
+	pods, err := ssc.podLister.Pods(set.Namespace).List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+
+	filter := func(pod *v1.Pod) bool {
+		// Only claim if it matches our StatefulSet name. Otherwise release/ignore.
+		return isMemberOf(set, pod)
+	}
+
+	cm := controller.NewPodControllerRefManager(ssc.podControl, set, selector, controllerKind, ssc.canAdoptFunc(ctx, set))
+	return cm.ClaimPods(ctx, pods, filter)
+}
+```
+
+### **2.2 ssc.syncStatefulSet**
+
+在 `syncStatefulSet` 中仅仅是调用了 `ssc.control.UpdateStatefulSet` 方法进行处理。
+
+`ssc.control.UpdateStatefulSet` 会调用 `defaultStatefulSetControl` 的 `UpdateStatefulSet` 方法，`defaultStatefulSetControl` 是 statefulset controller 中另外一个对象，主要负责处理 statefulset 的更新。
+
+```go
+// syncStatefulSet syncs a tuple of (statefulset, []*v1.Pod).
+func (ssc *StatefulSetController) syncStatefulSet(ctx context.Context, set *apps.StatefulSet, pods []*v1.Pod) error {
+	logger := klog.FromContext(ctx)
+	logger.V(4).Info("Syncing StatefulSet with pods", "statefulSet", klog.KObj(set), "pods", len(pods))
+	var status *apps.StatefulSetStatus
+	var err error
+	status, err = ssc.control.UpdateStatefulSet(ctx, set, pods)
+	if err != nil {
+		return err
+	}
+	logger.V(4).Info("Successfully synced StatefulSet", "statefulSet", klog.KObj(set))
+	// One more sync to handle the clock skew. This is also helping in requeuing right after status update
+	if set.Spec.MinReadySeconds > 0 && status != nil && status.AvailableReplicas != *set.Spec.Replicas {
+		ssc.enqueueSSAfter(set, time.Duration(set.Spec.MinReadySeconds)*time.Second)
+	}
+
+	return nil
+}
+
+
+```
+
+### 2.2.1  defaultStatefulSetControl.UpdateStatefulSet
+
+1. 获取statefulset的所有ControllerRevision并根据版本新老顺序排序；&#x20;
+2. 执行  performUpdate方法
+   1. 调用 ssc.getStatefulSetRevisions，计算 `currentRevision` 和 `updateRevision`，若 sts 处于更新过程中则 `currentRevision` 和 `updateRevision` 值不同；&#x20;
+   2. 调用ssc.updateStatefulSet，完成statefulset对象对于pod的创建、删除、更新、扩缩容等操作,执行实际的 sync 操作；
+   3. 调用ssc.updateStatefulSetStatus，更新statefulset对象的status状态；&#x20;
+3. 调用ssc.truncateHistory，根据statefulset对象配置的历史版本数量限制，按之前的排序顺序清理掉没有pod的statefulset历史版本。
+
+```go
+// UpdateStatefulSet executes the core logic loop for a stateful set, applying the predictable and
+// consistent monotonic update strategy by default - scale up proceeds in ordinal order, no new pod
+// is created while any pod is unhealthy, and pods are terminated in descending order. The burst
+// strategy allows these constraints to be relaxed - pods will be created and deleted eagerly and
+// in no particular order. Clients using the burst strategy should be careful to ensure they
+// understand the consistency implications of having unpredictable numbers of pods available.
+func (ssc *defaultStatefulSetControl) UpdateStatefulSet(ctx context.Context, set *apps.StatefulSet, pods []*v1.Pod) (*apps.StatefulSetStatus, error) {
+	set = set.DeepCopy() // set is modified when a new revision is created in performUpdate. Make a copy now to avoid mutation errors.
+
+	// list all revisions and sort them
+	revisions, err := ssc.ListRevisions(set)
+	if err != nil {
+		return nil, err
+	}
+	history.SortControllerRevisions(revisions)
+
+	currentRevision, updateRevision, status, err := ssc.performUpdate(ctx, set, pods, revisions)
+	if err != nil {
+		errs := []error{err}
+		if agg, ok := err.(utilerrors.Aggregate); ok {
+			errs = agg.Errors()
+		}
+		return nil, utilerrors.NewAggregate(append(errs, ssc.truncateHistory(set, pods, revisions, currentRevision, updateRevision)))
+	}
+
+	// maintain the set's revision history limit
+	return status, ssc.truncateHistory(set, pods, revisions, currentRevision, updateRevision)
+}
+
+func (ssc *defaultStatefulSetControl) performUpdate(
+	ctx context.Context, set *apps.StatefulSet, pods []*v1.Pod, revisions []*apps.ControllerRevision) (*apps.ControllerRevision, *apps.ControllerRevision, *apps.StatefulSetStatus, error) {
+	var currentStatus *apps.StatefulSetStatus
+	logger := klog.FromContext(ctx)
+	// get the current, and update revisions
+	currentRevision, updateRevision, collisionCount, err := ssc.getStatefulSetRevisions(set, revisions)
+	if err != nil {
+		return currentRevision, updateRevision, currentStatus, err
+	}
+
+	// perform the main update function and get the status
+	currentStatus, err = ssc.updateStatefulSet(ctx, set, currentRevision, updateRevision, collisionCount, pods)
+	if err != nil && currentStatus == nil {
+		return currentRevision, updateRevision, nil, err
+	}
+
+	// make sure to update the latest status even if there is an error with non-nil currentStatus
+	statusErr := ssc.updateStatefulSetStatus(ctx, set, currentStatus)
+	if statusErr == nil {
+		logger.V(4).Info("Updated status", "statefulSet", klog.KObj(set),
+			"replicas", currentStatus.Replicas,
+			"readyReplicas", currentStatus.ReadyReplicas,
+			"currentReplicas", currentStatus.CurrentReplicas,
+			"updatedReplicas", currentStatus.UpdatedReplicas)
+	}
+
+	switch {
+	case err != nil && statusErr != nil:
+		logger.Error(statusErr, "Could not update status", "statefulSet", klog.KObj(set))
+		return currentRevision, updateRevision, currentStatus, err
+	case err != nil:
+		return currentRevision, updateRevision, currentStatus, err
+	case statusErr != nil:
+		return currentRevision, updateRevision, currentStatus, statusErr
+	}
+
+	logger.V(4).Info("StatefulSet revisions", "statefulSet", klog.KObj(set),
+		"currentRevision", currentStatus.CurrentRevision,
+		"updateRevision", currentStatus.UpdateRevision)
+
+	return currentRevision, updateRevision, currentStatus, nil
+}
+```
+
+### **2.2.2 ssc.updateStatefulSet**
+
+主要逻辑：
+
+1. 分别获取 `currentRevision` 和 `updateRevision` 对应的的 statefulset object；
+2. 计算 status
+3. 定义两个 slice，分别是 replicas 和 condemned ，replicas 存储满足条件 getStartOrdinal(set) <= getOrdinal(pod) <= getEndOrdinal(set) 的 pod， replicas 存储满足条件 getOrdinal(pod)< getStartOrdinal(set) OR getOrdinal(pod) > getEndOrdinal(set) 的 pod ，这里的 ordinal 指的是pod的序号
+4. 第一个for循环，将pods分到replicas和condemned两个slice中，replicas数组代表正常的可用的pod列表，condemned数组中的是需要被删除的pod列表
+5. 第二个for循环，当序号小于statefulset期望副本数值的pod未创建出来时，则根据statefulset对象中的pod模板，构建出相应序号值的pod对象（此时还并没有向apiserver发起创建pod的请求，只是构建好pod结构体）
+6. 第三个和第四个for循环，遍历replicas和condemned两个数组，找到非healthy状态的最小序号的pod记录下来，并记录序号；
+7. 当 statefulset 对象的DeletionTimestamp不为nil时，直接返回前面计算出来的statefulset的新status值，不再进行方法后续的逻辑处理；
+8. 获取monotonic的值，当statefulset.Spec.PodManagementPolicy的值为Parallel时，monotonic的值为false，否则为true（Parallel代表statefulset controller可以并行的处理同一statefulset的pod，串行则代表在启动和终止下一个pod之前需要等待前一个pod变成ready状态或pod对象被删除掉）；
+9. 第五个for循环，遍历replicas数组，处理statefulset的pod，主要是做pod的创建（包括根据statefulset.Spec.VolumeClaimTemplates中定义的pod所需的pvc的创建）：
+   1. 当pod处于fail状态或者succeed（pod.Status.Phase的值为Failed或者succeed）时，调用apiserver删除该pod，新的pod会在下一次同步中创建
+   2. 如果相应序号的pod未创建时，调用apiserver创建该序号的pod（包括创建pvc），且当monotonic为true时（statefulset没有配置Parallel），直接return，结束updateStatefulSet方法的执行；&#x20;
+   3. 剩下的逻辑就是当没有配置Parallel时，将串行处理pod，在启动和终止下一个pod之前需要等待前一个pod变成ready状态或pod对象被删除掉，不再展开分析；&#x20;
+10. 第六个for循环，如果开启功能特性 AutoDeletePVC，做相应处理
+11. 第七个for循环，逆序（pod序号从大到小）遍历condemned数组，处理statefulset的pod，主要是做多余pod的删除，删除逻辑也受Parallel影响，不展开分析。&#x20;
+12. 更新 status
+13. 判断statefulset的更新策略，若为OnDelete，则直接return（使用了该更新策略，则需要人工删除pod后才会重建相应序号的pod）；&#x20;
+14. 如果开启功能特性 maxUnavailableStatefulSet  , 参考 ：[https://kubernetes.io/zh-cn/blog/2022/05/27/maxunavailable-for-statefulset/](https://kubernetes.io/zh-cn/blog/2022/05/27/maxunavailable-for-statefulset/)
+15. 获取滚动更新配置中的Partition值，当statefulset进行滚动更新时，小于等于该序号的pod将不会被更新；&#x20;
+16. 第八个for循环，主要是处理更新策略为RollingUpdate的statefulset对象的更新。若为 RollingUpdate 策略， 则倒序处理 replicas数组中下标大于等于Spec.UpdateStrategy.RollingUpdate.Partition 的 pod
+
+<pre class="language-go"><code class="lang-go">// updateStatefulSet performs the update function for a StatefulSet. This method creates, updates, and deletes Pods in
+// the set in order to conform the system to the target state for the set. The target state always contains
+// set.Spec.Replicas Pods with a Ready Condition. If the UpdateStrategy.Type for the set is
+// RollingUpdateStatefulSetStrategyType then all Pods in the set must be at set.Status.CurrentRevision.
+// If the UpdateStrategy.Type for the set is OnDeleteStatefulSetStrategyType, the target state implies nothing about
+// the revisions of Pods in the set. If the UpdateStrategy.Type for the set is PartitionStatefulSetStrategyType, then
+// all Pods with ordinal less than UpdateStrategy.Partition.Ordinal must be at Status.CurrentRevision and all other
+// Pods must be at Status.UpdateRevision. If the returned error is nil, the returned StatefulSetStatus is valid and the
+// update must be recorded. If the error is not nil, the method should be retried until successful.
+func (ssc *defaultStatefulSetControl) updateStatefulSet(
+	ctx context.Context,
+	set *apps.StatefulSet,
+	currentRevision *apps.ControllerRevision,
+	updateRevision *apps.ControllerRevision,
+	collisionCount int32,
+	pods []*v1.Pod) (*apps.StatefulSetStatus, error) {
+	logger := klog.FromContext(ctx)
+	// get the current and update revisions of the set.
+	currentSet, err := ApplyRevision(set, currentRevision)
+	if err != nil {
+		return nil, err
+	}
+	updateSet, err := ApplyRevision(set, updateRevision)
+	if err != nil {
+		return nil, err
+	}
+
+	// set the generation, and revisions in the returned status
+	status := apps.StatefulSetStatus{}
+	status.ObservedGeneration = set.Generation
+	status.CurrentRevision = currentRevision.Name
+	status.UpdateRevision = updateRevision.Name
+	status.CollisionCount = new(int32)
+	*status.CollisionCount = collisionCount
+
+	updateStatus(&#x26;status, set.Spec.MinReadySeconds, currentRevision, updateRevision, pods)
+
+	replicaCount := int(*set.Spec.Replicas)
+	// slice that will contain all Pods such that getStartOrdinal(set) &#x3C;= getOrdinal(pod) &#x3C;= getEndOrdinal(set)
+	replicas := make([]*v1.Pod, replicaCount)
+	// slice that will contain all Pods such that getOrdinal(pod) &#x3C; getStartOrdinal(set) OR getOrdinal(pod) > getEndOrdinal(set)
+	condemned := make([]*v1.Pod, 0, len(pods))
+	unhealthy := 0
+	var firstUnhealthyPod *v1.Pod
+
+	//  第一个for循环，将statefulset的pod分到replicas和condemned两个数组中，其中condemned数组中的pod代表需要被删除的
+	// First we partition pods into two lists valid replicas and condemned Pods
+	for _, pod := range pods {
+		if podInOrdinalRange(pod, set) {
+			// if the ordinal of the pod is within the range of the current number of replicas,
+			// insert it at the indirection of its ordinal
+			replicas[getOrdinal(pod)-getStartOrdinal(set)] = pod
+		} else if getOrdinal(pod) >= 0 {
+			// if the ordinal is valid, but not within the range add it to the condemned list
+			condemned = append(condemned, pod)
+		}
+		// If the ordinal could not be parsed (ord &#x3C; 0), ignore the Pod.
+	}
+
+	//  第二个for循环，当序号小于statefulset期望副本数值的pod未创建出来时，则根据statefulset对象中的pod模板，构建出相应序号值的pod对象（此时还并没有向apiserver发起创建pod的请求，只是构建好pod结构体）
+	// for any empty indices in the sequence [0,set.Spec.Replicas) create a new Pod at the correct revision
+	for ord := getStartOrdinal(set); ord &#x3C;= getEndOrdinal(set); ord++ {
+		replicaIdx := ord - getStartOrdinal(set)
+		if replicas[replicaIdx] == nil {
+			replicas[replicaIdx] = newVersionedStatefulSetPod(
+				currentSet,
+				updateSet,
+				currentRevision.Name,
+				updateRevision.Name, ord)
+		}
+	}
+
+	// sort the condemned Pods by their ordinals
+	sort.Sort(descendingOrdinal(condemned))
+
+	//  第三个和第四个for循环，遍历replicas和condemned两个数组，找到非healthy状态的最小序号的pod记录下来，并记录序号
+	// find the first unhealthy Pod
+	for i := range replicas {
+		if !isHealthy(replicas[i]) {
+			unhealthy++
+			if firstUnhealthyPod == nil {
+				firstUnhealthyPod = replicas[i]
+			}
+		}
+	}
+
+	// or the first unhealthy condemned Pod (condemned are sorted in descending order for ease of use)
+	for i := len(condemned) - 1; i >= 0; i-- {
+		if !isHealthy(condemned[i]) {
+			unhealthy++
+			if firstUnhealthyPod == nil {
+				firstUnhealthyPod = condemned[i]
+			}
+		}
+	}
+
+	if unhealthy > 0 {
+		logger.V(4).Info("StatefulSet has unhealthy Pods", "statefulSet", klog.KObj(set), "unhealthyReplicas", unhealthy, "pod", klog.KObj(firstUnhealthyPod))
+	}
+	// 当statefulset对象的DeletionTimestamp不为nil时，直接返回前面计算出来的statefulset的新status值，不再进行方法后续的逻辑处理
+	// If the StatefulSet is being deleted, don't do anything other than updating
+	// status.
+	if set.DeletionTimestamp != nil {
+		return &#x26;status, nil
+	}
+	// 获取monotonic的值，当statefulset.Spec.PodManagementPolicy的值为Parallel时，monotonic的值为false，否则为true
+	monotonic := !allowsBurst(set)
+
+	// First, process each living replica. Exit if we run into an error or something blocking in monotonic mode.
+	processReplicaFn := func(i int) (bool, error) {
+		return ssc.processReplica(ctx, set, updateSet, monotonic, replicas, i)
+	}
+	// 第五个for循环，遍历replicas数组，处理statefulset的pod，主要是做pod的创建
+	if shouldExit, err := runForAll(replicas, processReplicaFn, monotonic); shouldExit || err != nil {
+		updateStatus(&#x26;status, set.Spec.MinReadySeconds, currentRevision, updateRevision, replicas, condemned)
+		return &#x26;status, err
+	}
+	// 第六个for循环，如果开启功能特性 AutoDeletePVC，做相应处理
+	// Fix pod claims for condemned pods, if necessary.
+	if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetAutoDeletePVC) {
+		fixPodClaim := func(i int) (bool, error) {
+			if matchPolicy, err := ssc.podControl.ClaimsMatchRetentionPolicy(ctx, updateSet, condemned[i]); err != nil {
+				return true, err
+			} else if !matchPolicy {
+				if err := ssc.podControl.UpdatePodClaimForRetentionPolicy(ctx, updateSet, condemned[i]); err != nil {
+					return true, err
+				}
+			}
+			return false, nil
+		}
+		if shouldExit, err := runForAll(condemned, fixPodClaim, monotonic); shouldExit || err != nil {
+			updateStatus(&#x26;status, set.Spec.MinReadySeconds, currentRevision, updateRevision, replicas, condemned)
+			return &#x26;status, err
+		}
+	}
+	// 第七个for循环，逆序（pod序号从大到小）遍历condemned数组，处理statefulset的pod，主要是做多余pod的删除
+	// At this point, in monotonic mode all of the current Replicas are Running, Ready and Available,
+	// and we can consider termination.
+	// We will wait for all predecessors to be Running and Ready prior to attempting a deletion.
+	// We will terminate Pods in a monotonically decreasing order.
+	// Note that we do not resurrect Pods in this interval. Also note that scaling will take precedence over
+	// updates.
+	processCondemnedFn := func(i int) (bool, error) {
+		return ssc.processCondemned(ctx, set, firstUnhealthyPod, monotonic, condemned, i)
+	}
+	if shouldExit, err := runForAll(condemned, processCondemnedFn, monotonic); shouldExit || err != nil {
+		updateStatus(&#x26;status, set.Spec.MinReadySeconds, currentRevision, updateRevision, replicas, condemned)
+		return &#x26;status, err
+	}
+
+	updateStatus(&#x26;status, set.Spec.MinReadySeconds, currentRevision, updateRevision, replicas, condemned)
+
+<strong>	// 判断statefulset的更新策略，若为OnDelete，则直接return（使用了该更新策略，则需要人工删除pod后才会重建相应序号的pod）
+</strong>	// for the OnDelete strategy we short circuit. Pods will be updated when they are manually deleted.
+	if set.Spec.UpdateStrategy.Type == apps.OnDeleteStatefulSetStrategyType {
+		return &#x26;status, nil
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.MaxUnavailableStatefulSet) {
+		return updateStatefulSetAfterInvariantEstablished(ctx,
+			ssc,
+			set,
+			replicas,
+			updateRevision,
+			status,
+		)
+	}
+	// 获取滚动更新配置中的Partition值，当statefulset进行滚动更新时，小于等于该序号的pod将不会被更新
+	// we compute the minimum ordinal of the target sequence for a destructive update based on the strategy.
+	updateMin := 0
+	if set.Spec.UpdateStrategy.RollingUpdate != nil {
+		updateMin = int(*set.Spec.UpdateStrategy.RollingUpdate.Partition)
+	}
+	 // 第八个for循环，主要是处理更新策略为RollingUpdate的statefulset对象的更新，若为 RollingUpdate 策略，则倒序处理 replicas数组中下标大于等于
+    //        Spec.UpdateStrategy.RollingUpdate.Partition 的 pod
+	// we terminate the Pod with the largest ordinal that does not match the update revision.
+	for target := len(replicas) - 1; target >= updateMin; target-- {
+		// 如果Pod的Revision 不等于 updateRevision，且 pod 没有处于删除状态则直接删除 pod
+		// delete the Pod if it is not already terminating and does not match the update revision.
+		if getPodRevision(replicas[target]) != updateRevision.Name &#x26;&#x26; !isTerminating(replicas[target]) {
+			logger.V(2).Info("Pod of StatefulSet is terminating for update",
+				"statefulSet", klog.KObj(set), "pod", klog.KObj(replicas[target]))
+			if err := ssc.podControl.DeleteStatefulPod(set, replicas[target]); err != nil {
+				if !errors.IsNotFound(err) {
+					return &#x26;status, err
+				}
+			}
+			status.CurrentReplicas--
+			return &#x26;status, err
+		}
+
+		// wait for unhealthy Pods on update
+		if !isHealthy(replicas[target]) {
+			logger.V(4).Info("StatefulSet is waiting for Pod to update",
+				"statefulSet", klog.KObj(set), "pod", klog.KObj(replicas[target]))
+			return &#x26;status, nil
+		}
+
+	}
+	return &#x26;status, nil
+}
+</code></pre>
+
+<figure><img src="../../.gitbook/assets/image (1).png" alt=""><figcaption></figcaption></figure>
